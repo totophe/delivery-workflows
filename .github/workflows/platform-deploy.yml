@@ -1,0 +1,114 @@
+# The one workflow that talks to the deploy gateway.
+#
+# It proves who it is with a GitHub identity token and holds no key: the
+# gateway decides what this run may do from the token's content (repository,
+# branch, trigger, account) and accepts calls from this file only.
+#
+# One job: make the call, wait until the application reports the expected
+# commit, post the result on that commit.
+#
+# The calling repository (or its organisation) sets two variables:
+#   DEPLOY_GATEWAY_URL       https://… of the gateway
+#   DEPLOY_GATEWAY_AUDIENCE  the audience the gateway expects in the token
+#
+# The application answers on `health_path` with a body that contains the full
+# commit it runs (JSON or text; the first 40-character hexadecimal string is
+# taken).
+name: platform-deploy
+on:
+  workflow_call:
+    inputs:
+      action:   { type: string, required: true }   # deploy | open-preview | remove-preview | rollback
+      app:      { type: string, required: true }   # Coolify application id
+      stage:    { type: string, required: true }   # staging | preview | production
+      commit:   { type: string, required: false, default: "" }
+      pr:       { type: string, required: false, default: "" }
+      url:      { type: string, required: false, default: "" }   # public address of the application
+      health_path: { type: string, required: false, default: "/health" }
+jobs:
+  call:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      statuses: write
+      contents: read
+    env:
+      GATEWAY: ${{ vars.DEPLOY_GATEWAY_URL }}
+      AUDIENCE: ${{ vars.DEPLOY_GATEWAY_AUDIENCE }}
+      ACTION: ${{ inputs.action }}
+      APP: ${{ inputs.app }}
+      STAGE: ${{ inputs.stage }}
+      COMMIT: ${{ inputs.commit }}
+      PR: ${{ inputs.pr }}
+      URL: ${{ inputs.url }}
+      HEALTH: ${{ inputs.health_path }}
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+    steps:
+      - name: Check the inputs (they may come from a pull request)
+        run: |
+          set -eu
+          echo "$APP" | grep -Eq '^[a-z0-9]{20,32}$'
+          [ -z "$COMMIT" ] || echo "$COMMIT" | grep -Eq '^[0-9a-f]{40}$'
+          [ -z "$PR" ] || echo "$PR" | grep -Eq '^[1-9][0-9]{0,8}$'
+          [ -z "$URL" ] || echo "$URL" | grep -Eq '^https://[a-z0-9.-]+$'
+          echo "$HEALTH" | grep -Eq '^/[A-Za-z0-9._/-]*$'
+          echo "$GATEWAY" | grep -Eq '^https://[a-z0-9.-]+$' || { echo "set the repository variable DEPLOY_GATEWAY_URL"; exit 1; }
+          echo "$AUDIENCE" | grep -Eq '^[a-z0-9-]+$' || { echo "set the repository variable DEPLOY_GATEWAY_AUDIENCE"; exit 1; }
+      # Staging cannot be told a commit: Coolify deploys the head of the branch.
+      # So only the run of the commit that IS the head asks for a deploy; its
+      # image exists, because its own build just finished. A run for an older
+      # commit stands down: asking would deploy a head whose image may not be
+      # built yet: a failed deployment, staging left stale.
+      - name: Is this commit still the head of the branch? (staging)
+        id: head
+        if: inputs.stage == 'staging'
+        run: |
+          head=$(gh api "repos/$REPO/commits/${{ github.event.repository.default_branch }}" --jq .sha)
+          if [ "$head" = "$COMMIT" ]; then echo "this commit is the head"; else
+            echo "overtaken: the head is now $head; its own run deploys it"; echo "overtaken=yes" >> "$GITHUB_OUTPUT"; fi
+      - name: Call the gateway
+        if: steps.head.outputs.overtaken != 'yes'
+        run: |
+          set -eu
+          T=$(curl -sS -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=$AUDIENCE" | jq -r .value)
+          echo "::add-mask::$T"
+          case "$ACTION" in
+            deploy)
+              got=$(curl -sS -m 60 -o body.json -w '%{http_code}' -X POST -H "Authorization: Bearer $T" "$GATEWAY/api/v1/deploy?uuid=$APP") ;;
+            open-preview)
+              got=$(curl -sS -m 60 -o body.json -w '%{http_code}' -X POST -H "Authorization: Bearer $T" -H 'Content-Type: application/json' \
+                    -d "{\"pull_request_id\": $PR, \"commit\": \"$COMMIT\", \"pull_request_html_url\": \"https://github.com/$REPO/pull/$PR\"}" \
+                    "$GATEWAY/api/v1/applications/$APP/previews") ;;
+            rollback)
+              got=$(curl -sS -m 60 -o body.json -w '%{http_code}' -X POST -H "Authorization: Bearer $T" -H 'Content-Type: application/json' \
+                    -d "{\"commit\": \"$COMMIT\"}" "$GATEWAY/api/v1/applications/$APP/rollback") ;;
+            remove-preview)
+              got=$(curl -sS -m 60 -o body.json -w '%{http_code}' -X DELETE -H "Authorization: Bearer $T" "$GATEWAY/api/v1/applications/$APP/previews/$PR") ;;
+            *) echo "unknown action $ACTION"; exit 1 ;;
+          esac
+          echo "gateway answered $got: $(jq -c '{message, deployments: [.deployments[]?.message]}' body.json 2>/dev/null || head -c 300 body.json)"
+          case "$got" in 2*) ;; *) exit 1 ;; esac
+      - name: Wait until the application reports the commit
+        if: inputs.url != '' && inputs.commit != '' && steps.head.outputs.overtaken != 'yes'
+        run: |
+          # Staging cannot be told a commit: Coolify deploys the head of the
+          # branch. If a newer commit landed meanwhile, staging reports that
+          # one and this run has simply been overtaken. Never for production:
+          # a rollback goes to an OLDER commit on purpose.
+          for i in $(seq 1 40); do
+            running=$(curl -sS -m 10 "$URL$HEALTH" 2>/dev/null | grep -Eo '[0-9a-f]{40}' | head -n 1 || true)
+            if [ "$running" = "$COMMIT" ]; then echo "healthy at $COMMIT after $((i*8)) s: $URL"; exit 0; fi
+            if [ "$STAGE" = staging ] && echo "$running" | grep -Eq '^[0-9a-f]{40}$'; then
+              rel=$(gh api "repos/$REPO/compare/$COMMIT...$running" --jq .status 2>/dev/null || true)
+              if [ "$rel" = ahead ]; then echo "overtaken: $URL already runs $running, which contains $COMMIT"; exit 0; fi
+            fi
+            sleep 8
+          done
+          echo "the application never reported $COMMIT (last: ${running:-nothing})"; exit 1
+      - name: Post the result on the commit
+        if: always() && inputs.commit != '' && steps.head.outputs.overtaken != 'yes'
+        run: |
+          state=${{ job.status == 'success' && 'success' || 'failure' }}
+          gh api -X POST "repos/$REPO/statuses/$COMMIT" -f state="$state" -f context="deploy/$STAGE" \
+            -f description="$STAGE: $ACTION $state" ${URL:+-f target_url="$URL"} --jq '.context + " " + .state' || true
