@@ -90,7 +90,11 @@ jobs:
           echo "gateway answered $got: $(jq -c '{message, deployments: [.deployments[]?.message]}' body.json 2>/dev/null || head -c 300 body.json)"
           # A PR closed before it ever had a preview (its checks failed, or the
           # preview was never asked for): nothing to remove is not a failure.
-          if [ "$ACTION" = remove-preview ] && [ "$got" = 404 ]; then echo "no preview to remove"; exit 0; fi
+          # Only that exact answer: an unknown application is also a 404, and that
+          # one is a mistake in the setup that must stay visible.
+          if [ "$ACTION" = remove-preview ] && [ "$got" = 404 ] && jq -e '.message | test("^Preview not found")' body.json >/dev/null 2>&1; then
+            echo "no preview to remove"; exit 0
+          fi
           case "$got" in 2*) ;; *) exit 1 ;; esac
       - name: Wait until the application reports the commit
         if: inputs.url != '' && inputs.commit != '' && steps.head.outputs.overtaken != 'yes'
